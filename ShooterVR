@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scène A-Frame - Stand de tir VR & Cibles dynamiques</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <!-- Cannon.js pour A-Frame -->
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
+
+  <script>
+    // -------------------------------------------------------------
+    // Générateur sonore d'impact synthétique (Web Audio API)
+    // -------------------------------------------------------------
+    let audioCtx = null;
+    function playHitSound() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(580, audioCtx.currentTime); // Son type cloche / gong métallique
+      osc.frequency.exponentialRampToValueAtTime(140, audioCtx.currentTime + 0.25);
+
+      gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
+
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.25);
+    }
+
+    // -------------------------------------------------------------
+    // Cycle de vie des cibles (maintien dans la scène & nettoyage hors-limite)
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('target-entity', {
+      schema: {
+        originalColor: { type: 'string', default: '#ff4444' }
+      },
+
+      init: function () {
+        this.originalColor = this.data.originalColor;
+      },
+
+      onHit: function () {
+        playHitSound();
+
+        // Flash blanc de rétroaction visuelle
+        this.el.setAttribute('material', 'color', '#ffffff');
+        setTimeout(() => {
+          if (this.el.parentNode) {
+            this.el.setAttribute('material', 'color', this.originalColor);
+          }
+        }, 120);
+      },
+
+      tick: function () {
+        if (!this.el.body) return;
+        const pos = this.el.body.position;
+
+        // Destruction uniquement si l'objet passe sous la map ou vole trop loin
+        if (pos.y < -2 || Math.abs(pos.x) > 30 || Math.abs(pos.z) > 30) {
+          setTimeout(() => {
+            if (this.el.parentNode) {
+              this.el.parentNode.removeChild(this.el);
+            }
+          }, 0);
+        }
+      }
+    });
+
+    // -------------------------------------------------------------
+    // Générateur automatique de cibles aléatoires
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('target-spawner', {
+      schema: {
+        interval: { type: 'number', default: 3500 }, // délai en ms
+        maxTargets: { type: 'number', default: 8 }
+      },
+
+      init: function () {
+        this.shapes = ['box', 'cylinder', 'cone'];
+        this.colors = ['#e67e22', '#9b59b6', '#1abc9c', '#e74c3c'];
+
+        this.timer = setInterval(() => {
+          this.spawn();
+        }, this.data.interval);
+      },
+
+      spawn: function () {
+        const count = document.querySelectorAll('.target-item').length;
+        if (count >= this.data.maxTargets) return;
+
+        const shape = this.shapes[Math.floor(Math.random() * this.shapes.length)];
+        const color = this.colors[Math.floor(Math.random() * this.colors.length)];
+
+        // Position aléatoire devant le joueur
+        const posX = (Math.random() - 0.5) * 6;
+        const posY = 1.2 + Math.random() * 1.5;
+        const posZ = -3 - Math.random() * 4;
+
+        const target = document.createElement(shape === 'cone' ? 'a-cone' : (shape === 'cylinder' ? 'a-cylinder' : 'a-box'));
+        target.classList.add('grabbable', 'target-item');
+        target.setAttribute('position', `${posX} ${posY} ${posZ}`);
+        target.setAttribute('material', `color: ${color}`);
+        target.setAttribute('shadow', 'cast: true; receive: true');
+
+        if (shape === 'cone') {
+          target.setAttribute('radius-bottom', '0.35');
+          target.setAttribute('radius-top', '0.05');
+          target.setAttribute('height', '0.7');
+          target.setAttribute('dynamic-body', 'mass: 1.5; shape: cylinder');
+        } else if (shape === 'cylinder') {
+          target.setAttribute('radius', '0.3');
+          target.setAttribute('height', '0.6');
+          target.setAttribute('dynamic-body', 'mass: 1.5; shape: cylinder');
+        } else {
+          target.setAttribute('width', '0.5');
+          target.setAttribute('height', '0.5');
+          target.setAttribute('depth', '0.5');
+          target.setAttribute('dynamic-body', 'mass: 1.5; shape: box');
+        }
+
+        target.setAttribute('target-entity', `originalColor: ${color}`);
+        this.el.sceneEl.appendChild(target);
+      },
+
+      remove: function () {
+        clearInterval(this.timer);
+      }
+    });
+
+    // -------------------------------------------------------------
+    // Déplacement et vue aux joysticks
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('vr-player', {
+      schema: {
+        speed: {type: 'number', default: 3},
+        turnSpeed: {type: 'number', default: 2},
+        elevateSpeed: {type: 'number', default: 2}
+      },
+
+      init: function () {
+        this.moveAxis = [0, 0];
+        this.turnAxis = 0;
+        this.elevateAxis = 0;
+
+        this.onMove = (e) => {
+          this.moveAxis = [e.detail.x || 0, e.detail.y || 0];
+        };
+        this.onRightStick = (e) => {
+          this.turnAxis = e.detail.x || 0;
+          this.elevateAxis = e.detail.y || 0;
+        };
+
+        this.leftController = this.el.querySelector('#left-controller');
+        this.rightController = this.el.querySelector('#right-controller');
+        this.camera = this.el.querySelector('a-camera');
+
+        this.leftController.addEventListener('thumbstickmoved', this.onMove);
+        this.rightController.addEventListener('thumbstickmoved', this.onRightStick);
+      },
+
+      tick: function (time, delta) {
+        const dt = Math.min(delta, 100) / 1000;
+
+        if (Math.abs(this.turnAxis) > 0.1) {
+          this.el.object3D.rotation.y -= this.turnAxis * this.data.turnSpeed * dt;
+        }
+        if (Math.abs(this.elevateAxis) > 0.1) {
+          this.el.object3D.position.y -= this.elevateAxis * this.data.elevateSpeed * dt;
+        }
+
+        const moveX = this.moveAxis[0];
+        const moveZ = this.moveAxis[1];
+        if (Math.abs(moveX) > 0.1 || Math.abs(moveZ) > 0.1) {
+          const camYaw = this.camera ? this.camera.object3D.rotation.y : 0;
+          const totalYaw = this.el.object3D.rotation.y + camYaw;
+          const dist = this.data.speed * dt;
+
+          this.el.object3D.position.x += (moveX * Math.cos(totalYaw) + moveZ * Math.sin(totalYaw)) * dist;
+          this.el.object3D.position.z += (-moveX * Math.sin(totalYaw) + moveZ * Math.cos(totalYaw)) * dist;
+        }
+      }
+    });
+
+    // -------------------------------------------------------------
+    // Composant arme : instancie la balle
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('gun', {
+      schema: {
+        bulletSpeed: { type: 'number', default: 60 }
+      },
+
+      shoot: function () {
+        const scene = this.el.sceneEl;
+        const muzzle = this.el.querySelector('#muzzle');
+
+        const muzzleWorldPos = new THREE.Vector3();
+        const gunWorldPos = new THREE.Vector3();
+
+        if (muzzle) {
+          muzzle.object3D.getWorldPosition(muzzleWorldPos);
+        } else {
+          this.el.object3D.getWorldPosition(muzzleWorldPos);
+        }
+        this.el.object3D.getWorldPosition(gunWorldPos);
+
+        const forward = new THREE.Vector3()
+          .subVectors(muzzleWorldPos, gunWorldPos)
+          .normalize();
+
+        const bullet = document.createElement('a-sphere');
+        bullet.setAttribute('radius', '0.04');
+        bullet.setAttribute('color', '#f1c40f');
+        bullet.setAttribute('position', `${muzzleWorldPos.x} ${muzzleWorldPos.y} ${muzzleWorldPos.z}`);
+        bullet.setAttribute('shadow', 'cast: true');
+
+        bullet.setAttribute('ray-bullet', `
+          dirX: ${forward.x};
+          dirY: ${forward.y};
+          dirZ: ${forward.z};
+          speed: ${this.data.bulletSpeed};
+          startX: ${muzzleWorldPos.x};
+          startY: ${muzzleWorldPos.y};
+          startZ: ${muzzleWorldPos.z}
+        `);
+
+        scene.appendChild(bullet);
+      }
+    });
+
+    // -------------------------------------------------------------
+    // Détection continue par rayon & transmission des impacts
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('ray-bullet', {
+      schema: {
+        dirX: { type: 'number', default: 0 },
+        dirY: { type: 'number', default: 0 },
+        dirZ: { type: 'number', default: 0 },
+        speed: { type: 'number', default: 60 },
+        startX: { type: 'number', default: 0 },
+        startY: { type: 'number', default: 0 },
+        startZ: { type: 'number', default: 0 },
+        maxDist: { type: 'number', default: 45 }
+      },
+
+      init: function () {
+        this.dir = new THREE.Vector3(this.data.dirX, this.data.dirY, this.data.dirZ).normalize();
+        this.startPos = new THREE.Vector3(this.data.startX, this.data.startY, this.data.startZ);
+        this.prevPos = this.startPos.clone();
+        this.currPos = this.startPos.clone();
+
+        this.raycaster = new THREE.Raycaster();
+        this.isDead = false;
+
+        this.timer = setTimeout(() => {
+          this.destroyBullet();
+        }, 2000);
+      },
+
+      tick: function (time, delta) {
+        if (this.isDead) return;
+        const dt = Math.min(delta, 100) / 1000;
+        const stepDist = this.data.speed * dt;
+
+        this.prevPos.copy(this.el.object3D.position);
+        this.currPos.copy(this.prevPos).addScaledVector(this.dir, stepDist);
+
+        this.raycaster.set(this.prevPos, this.dir);
+        this.raycaster.far = stepDist;
+
+        const hitTargets = Array.from(document.querySelectorAll('.grabbable, a-plane'));
+        const hitObjects = [];
+        hitTargets.forEach(el => {
+          if (el.object3D && el !== this.el) hitObjects.push(el.object3D);
+        });
+
+        const intersects = this.raycaster.intersectObjects(hitObjects, true);
+
+        if (intersects.length > 0) {
+          const hit = intersects[0];
+          let targetEl = hit.object.el;
+          while (targetEl && !targetEl.classList.contains('grabbable') && targetEl.tagName.toLowerCase() !== 'a-plane') {
+            targetEl = targetEl.parentElement;
+          }
+
+          // Détection d'impact sur une entité physique
+          if (targetEl && targetEl.body) {
+            const hitPoint = new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z);
+            const impulseForce = 14;
+            const impulse = new CANNON.Vec3(
+              this.dir.x * impulseForce,
+              this.dir.y * impulseForce,
+              this.dir.z * impulseForce
+            );
+            targetEl.body.applyImpulse(impulse, hitPoint);
+
+            // Alerte la cible touchée sans la détruire
+            if (targetEl.components['target-entity']) {
+              targetEl.components['target-entity'].onHit();
+            }
+          }
+
+          this.el.object3D.position.copy(hit.point);
+          this.destroyBullet();
+          return;
+        }
+
+        this.el.object3D.position.copy(this.currPos);
+
+        if (this.currPos.y <= 0.05 || this.currPos.distanceTo(this.startPos) > this.data.maxDist) {
+          this.destroyBullet();
+        }
+      },
+
+      destroyBullet: function () {
+        if (this.isDead) return;
+        this.isDead = true;
+        if (this.timer) clearTimeout(this.timer);
+
+        setTimeout(() => {
+          if (this.el.parentNode) {
+            this.el.parentNode.removeChild(this.el);
+          }
+        }, 0);
+      }
+    });
+
+    // -------------------------------------------------------------
+    // Saisie (Grip) et tir (Trigger)
+    // -------------------------------------------------------------
+    AFRAME.registerComponent('physics-grabber', {
+      schema: {
+        throwMultiplier: { type: 'number', default: 1.4 }
+      },
+
+      init: function () {
+        this.grabbedEl = null;
+        this.targetEl = null;
+        this.isGun = false;
+
+        this.positions = [];
+        this.handWorldPos = new THREE.Vector3();
+        this.handWorldQuat = new THREE.Quaternion();
+
+        this.grabOffsetPos = new THREE.Vector3();
+        this.grabOffsetQuat = new THREE.Quaternion();
+
+        this._tmpObjPos = new THREE.Vector3();
+        this._tmpObjQuat = new THREE.Quaternion();
+        this._tmpInvHandQuat = new THREE.Quaternion();
+        this._tmpTargetPos = new THREE.Vector3();
+        this._tmpTargetQuat = new THREE.Quaternion();
+
+        this.el.addEventListener('raycaster-intersection', (e) => {
+          const valid = e.detail.els.filter(el => el.classList.contains('grabbable'));
+          if (valid.length > 0) this.targetEl = valid[0];
+        });
+
+        this.el.addEventListener('raycaster-intersection-cleared', () => {
+          this.targetEl = null;
+        });
+
+        const onGrab = () => {
+          if (!this.targetEl || this.grabbedEl) return;
+          this.grabbedEl = this.targetEl;
+          this.isGun = this.grabbedEl.hasAttribute('gun');
+          this.positions = [];
+
+          this.el.object3D.getWorldPosition(this.handWorldPos);
+          this.el.object3D.getWorldQuaternion(this.handWorldQuat);
+
+          if (this.isGun) {
+            this.grabOffsetPos.set(0, -0.04, -0.08);
+            this.grabOffsetQuat.setFromAxisAngle(
+              new THREE.Vector3(1, 0, 0),
+              THREE.MathUtils.degToRad(-25)
+            );
+          } else {
+            this.grabbedEl.object3D.getWorldPosition(this._tmpObjPos);
+            this.grabbedEl.object3D.getWorldQuaternion(this._tmpObjQuat);
+
+            this._tmpInvHandQuat.copy(this.handWorldQuat).conjugate();
+
+            this.grabOffsetPos
+              .copy(this._tmpObjPos)
+              .sub(this.handWorldPos)
+              .applyQuaternion(this._tmpInvHandQuat);
+
+            this.grabOffsetQuat
+              .copy(this._tmpInvHandQuat)
+              .multiply(this._tmpObjQuat);
+          }
+        };
+
+        const onRelease = () => {
+          if (!this.grabbedEl) return;
+          const body = this.grabbedEl.body;
+
+          if (body && this.positions.length >= 2) {
+            const oldest = this.positions[0];
+            const newest = this.positions[this.positions.length - 1];
+            const totalDt = (newest.time - oldest.time) / 1000;
+
+            if (totalDt > 0.01) {
+              const vx = ((newest.pos.x - oldest.pos.x) / totalDt) * this.data.throwMultiplier;
+              const vy = ((newest.pos.y - oldest.pos.y) / totalDt) * this.data.throwMultiplier;
+              const vz = ((newest.pos.z - oldest.pos.z) / totalDt) * this.data.throwMultiplier;
+
+              body.velocity.set(vx, vy, vz);
+            }
+          }
+
+          this.grabbedEl = null;
+          this.isGun = false;
+          this.positions = [];
+        };
+
+        const onTriggerDown = () => {
+          if (this.grabbedEl && this.isGun) {
+            this.grabbedEl.components['gun'].shoot();
+          } else if (!this.grabbedEl) {
+            onGrab();
+          }
+        };
+
+        const onTriggerUp = () => {
+          if (this.grabbedEl && !this.isGun) {
+            onRelease();
+          }
+        };
+
+        this.el.addEventListener('gripdown', onGrab);
+        this.el.addEventListener('gripup', onRelease);
+        this.el.addEventListener('triggerdown', onTriggerDown);
+        this.el.addEventListener('triggerup', onTriggerUp);
+      },
+
+      tick: function (time, delta) {
+        this.el.object3D.getWorldPosition(this.handWorldPos);
+        this.el.object3D.getWorldQuaternion(this.handWorldQuat);
+
+        this.positions.push({
+          pos: this.handWorldPos.clone(),
+          time: performance.now()
+        });
+        if (this.positions.length > 6) {
+          this.positions.shift();
+        }
+
+        if (this.grabbedEl && this.grabbedEl.body) {
+          const body = this.grabbedEl.body;
+
+          this._tmpTargetPos
+            .copy(this.grabOffsetPos)
+            .applyQuaternion(this.handWorldQuat)
+            .add(this.handWorldPos);
+
+          this._tmpTargetQuat
+            .copy(this.handWorldQuat)
+            .multiply(this.grabOffsetQuat);
+
+          body.position.set(this._tmpTargetPos.x, this._tmpTargetPos.y, this._tmpTargetPos.z);
+          body.quaternion.set(this._tmpTargetQuat.x, this._tmpTargetQuat.y, this._tmpTargetQuat.z, this._tmpTargetQuat.w);
+
+          body.velocity.set(0, 0, 0);
+          body.angularVelocity.set(0, 0, 0);
+        }
+      }
+    });
+  </script>
+</head>
+<body>
+  <a-scene
+    physics="debug: false; gravity: -9.8"
+    renderer="shadows: enabled"
+    background="color: #87ceeb"
+    target-spawner="interval: 3500; maxTargets: 8">
+
+    <a-entity light="type: ambient; color: #ffffff; intensity: 0.6"></a-entity>
+    <a-entity
+      light="type: directional; color: #ffffff; intensity: 1.2; castShadow: true; shadowMapWidth: 2048; shadowMapHeight: 2048"
+      position="-3 6 4">
+    </a-entity>
+
+    <!-- Sol statique -->
+    <a-plane
+      static-body
+      position="0 0 0"
+      rotation="-90 0 0"
+      width="30"
+      height="30"
+      color="#6b8e23"
+      shadow="receive: true">
+    </a-plane>
+
+    <!-- Cibles initiales (cubes, sphère et cône) -->
+    <a-box
+      class="grabbable target-item"
+      target-entity="originalColor: #e74c3c"
+      dynamic-body="mass: 2; shape: box"
+      position="-0.6 1.5 -2"
+      rotation="0 15 0"
+      width="0.5" height="0.5" depth="0.5"
+      color="#e74c3c"
+      shadow="cast: true; receive: true">
+    </a-box>
+
+    <a-box
+      class="grabbable target-item"
+      target-entity="originalColor: #f39c12"
+      dynamic-body="mass: 2; shape: box"
+      position="-0.6 0.5 -2"
+      rotation="0 15 0"
+      width="0.5" height="0.5" depth="0.5"
+      color="#f39c12"
+      shadow="cast: true; receive: true">
+    </a-box>
+
+    <a-sphere
+      class="grabbable target-item"
+      target-entity="originalColor: #3498db"
+      dynamic-body="mass: 2; shape: sphere"
+      position="0.6 1.2 -2"
+      radius="0.3"
+      color="#3498db"
+      shadow="cast: true; receive: true">
+    </a-sphere>
+
+    <a-cone
+      class="grabbable target-item"
+      target-entity="originalColor: #9b59b6"
+      dynamic-body="mass: 1.5; shape: cylinder"
+      position="0 0.5 -2.5"
+      radius-bottom="0.3"
+      radius-top="0.05"
+      height="0.6"
+      color="#9b59b6"
+      shadow="cast: true; receive: true">
+    </a-cone>
+
+    <!-- Arme à feu -->
+    <a-box
+      id="pistol"
+      class="grabbable"
+      gun="bulletSpeed: 60"
+      dynamic-body="mass: 1.5; shape: box"
+      position="0 1 -0.8"
+      width="0.08" height="0.08" depth="0.32"
+      color="#2c3e50"
+      shadow="cast: true; receive: true">
+
+      <a-box
+        width="0.06" height="0.14" depth="0.07"
+        position="0 -0.09 0.08"
+        rotation="15 0 0"
+        color="#7f8c8d">
+      </a-box>
+
+      <a-entity id="muzzle" position="0 0 -0.2"></a-entity>
+    </a-box>
+
+    <!-- Rig du joueur -->
+    <a-entity id="player" vr-player position="0 0 1.2">
+      <a-camera position="0 1.6 0"></a-camera>
+
+      <a-entity
+        id="left-controller"
+        physics-grabber
+        oculus-touch-controls="hand: left"
+        laser-controls="hand: left"
+        raycaster="objects: .grabbable; far: 1.5">
+      </a-entity>
+
+      <a-entity
+        id="right-controller"
+        physics-grabber
+        oculus-touch-controls="hand: right"
+        laser-controls="hand: right"
+        raycaster="objects: .grabbable; far: 1.5">
+      </a-entity>
+    </a-entity>
+
+  </a-scene>
+</body>
+</html>
